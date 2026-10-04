@@ -1,0 +1,89 @@
+name: build
+
+# 说明：
+#   1) 本工作流假设仓库根目录是包含 bordd.py、bordd_gui.py、assets/
+#      与 bordd_dist/ 的那一层，因此本文件位于仓库根的 .github/workflows/ 下。
+#   2) macOS 产物不能直接交给 upload-artifact：GitHub 官方帮助明确写着
+#      "File permissions are not maintained during artifact upload"，
+#      上传 .app 会丢掉 Contents/MacOS/ 里的可执行位，下载回来双击没反应。
+#      所以 CI 里先用 bordd_dist/make_app_zip.py 把 .app 压成一个「内部权限
+#      正确」的 zip，再把「这个 zip 文件」当普通文件上传 —— 传输只需保证
+#      内容不变，这一点是可靠的。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: Bordd-windows
+          - os: macos-latest
+            artifact: Bordd-macos
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r bordd_dist/requirements.txt pyinstaller
+
+      - name: 语法检查
+        run: python -m py_compile bordd.py bordd_gui.py
+
+      # 直接调用与本地一致的一键构建脚本，保证 CI 与本地产物同源
+      - name: 构建（Windows：Bordd_gui\ + Bordd_cli\）
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: bordd_dist\build_windows.bat
+
+      - name: 构建（macOS：Bordd.app，优先 universal2）
+        if: runner.os == 'macOS'
+        run: |
+          chmod +x bordd_dist/build_mac.sh
+          bordd_dist/build_mac.sh
+
+      # macOS 关键一步：自己压 zip，保住可执行位与符号链接。
+      # 脚本自带校验：入口若缺可执行位会返回非 0，让这一步直接失败。
+      # 产物名特意与 GitHub 产物的外层 zip 区分开，避免"包里还有包"搞混。
+      - name: 打包 macOS .app 为权限正确的 zip
+        if: runner.os == 'macOS'
+        run: |
+          python bordd_dist/make_app_zip.py \
+            bordd_dist/dist/Bordd.app \
+            bordd_dist/dist/Bordd-macos-app.zip
+
+      - name: 列出产物
+        working-directory: bordd_dist
+        shell: bash
+        run: ls -la dist
+
+      - name: 上传（Windows 目录产物）
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          if-no-files-found: error
+          path: |
+            bordd_dist/dist/Bordd_gui/
+            bordd_dist/dist/Bordd_cli/
+
+      - name: 上传（macOS 单个 zip，权限已内嵌）
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          if-no-files-found: error
+          path: bordd_dist/dist/Bordd-macos-app.zip

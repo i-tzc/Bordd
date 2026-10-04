@@ -1,0 +1,23 @@
+# Bordd requirements
+#
+# Install:
+#     pip install -r requirements.txt
+#
+# NOTE: this file is intentionally ASCII-only. pip decodes requirement files
+# using the system locale encoding (GBK on Simplified Chinese Windows), so a
+# UTF-8 file with Chinese comments fails to parse there.
+#
+# The GUI is built on the standard-library tkinter module, so it needs no
+# extra package (it ships with the official Python installers; on Linux you
+# may need python3-tk).
+
+# ---- runtime dependencies ----
+Pillow==12.3.0        # image reading/writing and border compositing
+# NOTE: 10.13.0 itself was yanked from PyPI ("incomplete release"), so pin the
+# .post1 rebuild -- it is the version this project was built and tested with.
+pikepdf==10.13.0.post1  # only for --format pdf (byte-exact JPEG embedding)
+
+# ---- build-only dependency (not needed to run the built binaries) ----
+# Install separately when packaging:
+#     pip install pyinstaller
+# pyinstaller==6.22.3

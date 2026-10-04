@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# PyInstaller 构建中间产物
+bordd_dist/build/
+bordd_dist/dist/
+
+# 打包给 Mac 用户的传输包（由 make_mac_share.py 生成）
+mac_share/
+
+# 测试脚本的工作目录
+_smoke_work/
+_verify_work/
+_verify_tmp/
+
+# 本地生成的 macOS 图标（可由 assets/icon_png 重新生成；
+# 注意 Bordd.icns 现在由 make_icon.py 直接生成，默认保留）
+# assets/Bordd.icns
