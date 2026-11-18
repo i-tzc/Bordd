@@ -1,0 +1,28 @@
+# 统一换行符，避免 Windows 上的 git 把脚本转成 CRLF。
+#
+# 背景：macOS 执行 .sh / .app 里的入口脚本时，如果文件是 CRLF，
+# 会报 "bad interpreter: /bin/bash^M" 之类的错误，.app 直接启动不了。
+# 这里显式声明这些文件在仓库里必须是 LF。
+
+*.sh        text eol=lf
+*.command   text eol=lf
+*.plist     text eol=lf
+*.py        text eol=lf
+*.spec      text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.md        text eol=lf
+*.txt       text eol=lf
+*.toml      text eol=lf
+*.ini       text eol=lf
+
+# 批处理也保持 LF：本项目的 .bat 一直以 LF 运行正常，
+# 且启动器内容是纯 ASCII，不依赖 CRLF。
+*.bat       text eol=lf
+
+# 这些是二进制，不要做换行转换
+*.png       binary
+*.ico       binary
+*.icns      binary
+*.exe       binary
+*.zip       binary
