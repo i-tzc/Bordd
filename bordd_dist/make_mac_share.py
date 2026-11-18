@@ -53,7 +53,7 @@ APP_IN_PKG = "Bordd.app"
 MANUAL_NAME = "使用说明.txt"
 SCREENSHOT_NAME = "界面预览.png"
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # 包内需要「可执行」权限的文件
 EXECUTABLE = {

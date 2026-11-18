@@ -38,16 +38,22 @@ Bordd_gui.exe / Bordd.app），双击即可使用。
       · 此模式下 --ratio / --color 被忽略。
 
 用法示例：
-  python Bordd.py --input ./images --output ./output --ratio 4:3 --color black
-  python Bordd.py --input ./images --output ./output --ratio 1:1 --color white --border-percent 0.1
-  python Bordd.py -i ./photos -o ./result -r 21:9 -c black --border-percent 0.15
-  python Bordd.py -i ./photos -o ./result -r 4:3 --format png
-  python Bordd.py -i ./photos -o ./result -r 4:3 --format pdf
-  python Bordd.py -i ./photos -o ./compressed --no-border --jpeg-quality 90
+  python bordd.py --input ./images --output ./output --ratio 4:3 --color black
+  python bordd.py --input ./images --output ./output --ratio 1:1 --color white --border-percent 0.1
+  python bordd.py -i ./photos -o ./result -r 21:9 -c black --border-percent 0.15
+  python bordd.py -i ./photos -o ./result -r 4:3 --format png
+  python bordd.py -i ./photos -o ./result -r 4:3 --format pdf
+  python bordd.py -i ./photos -o ./compressed --no-border --jpeg-quality 90
+
+v1.3 新增：
+  · 输入可以是单个图片文件，输出名默认加 _bdd 后缀（可用 --suffix 自定义）；
+  · --max-size 10MB 可限制单张输出体积，超出时自动逐个降低 JPEG 质量。
 """
 
 import argparse
+import io
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -95,6 +101,49 @@ def get_border_color(color_str: str):
     if key not in color_map:
         raise ValueError(f"不支持的颜色: {color_str}，可选: black 或 white")
     return color_map[key]
+
+
+# 体积单位换算（1 KB = 1024 B）
+_SIZE_UNITS = {
+    "": 1, "B": 1,
+    "K": 1024, "KB": 1024, "KIB": 1024,
+    "M": 1024 ** 2, "MB": 1024 ** 2, "MIB": 1024 ** 2,
+    "G": 1024 ** 3, "GB": 1024 ** 3, "GIB": 1024 ** 3,
+}
+
+
+def parse_size(text) -> int:
+    """把体积字符串解析成字节数；空值或 0 表示“不限制”。
+
+    支持：'10MB'、'500KB'、'1.5M'、'2G'、'10485760'（纯数字按字节）。
+    """
+    if text is None:
+        return 0
+    if isinstance(text, (int, float)):
+        return max(int(text), 0)
+    s = str(text).strip().upper().replace(" ", "")
+    if not s:
+        return 0
+    m = re.fullmatch(r"([0-9]*\.?[0-9]+)([A-Z]*)", s)
+    if not m:
+        raise ValueError(
+            f"无法识别的体积格式: {text}（示例：10MB、500KB、10485760）"
+        )
+    number, unit = m.group(1), m.group(2)
+    if unit not in _SIZE_UNITS:
+        raise ValueError(f"不支持的体积单位: {unit}（可用 KB / MB / GB）")
+    return int(float(number) * _SIZE_UNITS[unit])
+
+
+def format_size(nbytes: int) -> str:
+    """把字节数显示成 '9.83 MB' 这样的短字符串。"""
+    if nbytes >= 1024 ** 3:
+        return f"{nbytes / 1024 ** 3:.2f} GB"
+    if nbytes >= 1024 ** 2:
+        return f"{nbytes / 1024 ** 2:.2f} MB"
+    if nbytes >= 1024:
+        return f"{nbytes / 1024:.1f} KB"
+    return f"{nbytes} B"
 
 
 def compute_canvas_size(img_w: int, img_h: int,
@@ -313,6 +362,96 @@ def jpeg_to_pdf_lossless(src_path: Path,
     pdf.save(str(out_path), compress_streams=False)
 
 
+def _encode_bytes(img, save_format: str, kwargs: dict) -> bytes:
+    """把图片编码到内存，返回字节数据（便于反复试不同质量而不落盘）。"""
+    buf = io.BytesIO()
+    img.save(buf, format=save_format, **kwargs)
+    return buf.getvalue()
+
+
+def save_with_size_limit(img, out_path, save_format: str, kwargs: dict,
+                         max_bytes: int = 0, minimum_quality: int = 1,
+                         emit=None):
+    """保存图片；给了体积上限时，在“不超过上限”的前提下选**最高**质量。
+
+    实现思路（等价于“95 → 94 → 93 … 逐个试”，但快得多）：
+        1. 先用设定质量编一次，没超限就直接保存 —— 绝大多数情况只编码 1 次；
+        2. 超限则二分查找“还能满足上限的最高质量”（约 7 次编码），
+           而不是从 95 一路线性试到 60（那要几十次）；
+        3. 最后向上再确认一次，避免体积非严格单调导致漏掉更高档。
+
+    只有 JPEG / WebP 这类“有质量旋钮”的格式能压体积；
+    PNG 等无损格式无法通过质量调体积，仅在超限时给出提示。
+
+    返回 (实际使用的质量, 最终字节数, 是否满足上限)。
+    """
+    log = emit or _default_log
+    out_path = Path(out_path)
+
+    # ---- 未设上限：按原样保存 ----
+    if max_bytes <= 0:
+        img.save(out_path, format=save_format, **kwargs)
+        return kwargs.get("quality"), out_path.stat().st_size, True
+
+    # ---- 上限对无损格式无效：照常保存并提示 ----
+    if save_format not in ("JPEG", "WEBP"):
+        img.save(out_path, format=save_format, **kwargs)
+        size = out_path.stat().st_size
+        if size > max_bytes:
+            log(f"  提示：{out_path.name} 为 {format_size(size)}，"
+                f"超过上限 {format_size(max_bytes)}；"
+                f"但 {save_format} 是无损格式，无法通过降低质量来压缩", "warn")
+        return kwargs.get("quality"), size, True
+
+    start_quality = int(kwargs.get("quality", 95))
+    start_quality = max(min(start_quality, 100), minimum_quality)
+
+    # ---- 1) 设定质量直接达标 ----
+    best_q = start_quality
+    best_data = _encode_bytes(img, save_format, dict(kwargs, quality=best_q))
+    if len(best_data) <= max_bytes:
+        out_path.write_bytes(best_data)
+        return best_q, len(best_data), True
+
+    # ---- 2) 最低质量都超限：只能保存最低质量并告警 ----
+    floor_data = _encode_bytes(img, save_format,
+                               dict(kwargs, quality=minimum_quality))
+    if len(floor_data) > max_bytes:
+        out_path.write_bytes(floor_data)
+        log(f"  提示：即使质量降到 {minimum_quality}，体积仍有 "
+            f"{format_size(len(floor_data))}，超过上限 "
+            f"{format_size(max_bytes)}（图片本身太大或上限过小）", "warn")
+        return minimum_quality, len(floor_data), False
+
+    best_q, best_data = minimum_quality, floor_data
+
+    # ---- 3) 二分找“仍满足上限的最高质量” ----
+    lo, hi = minimum_quality, start_quality - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        data = _encode_bytes(img, save_format, dict(kwargs, quality=mid))
+        if len(data) <= max_bytes:
+            if mid > best_q:
+                best_q, best_data = mid, data
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    # ---- 4) 兜底向上校正（最多几步，防止体积非严格单调）----
+    for _ in range(4):
+        if best_q >= start_quality:
+            break
+        nxt = best_q + 1
+        data = _encode_bytes(img, save_format, dict(kwargs, quality=nxt))
+        if len(data) <= max_bytes:
+            best_q, best_data = nxt, data
+        else:
+            break
+
+    out_path.write_bytes(best_data)
+    return best_q, len(best_data), True
+
+
 class ProcessingCancelled(Exception):
     """用户主动中止批处理时抛出（GUI 的“停止”按钮）。"""
 
@@ -347,13 +486,24 @@ def process_directory(input_dir: str,
                       no_border: bool = False,
                       log=None,
                       progress=None,
-                      should_cancel=None):
-    """批量处理目录下所有支持的图片文件。
+                      should_cancel=None,
+                      input_files=None,
+                      name_suffix: str = "",
+                      max_bytes: int = 0):
+    """批量处理图片。
+
+    输入有三种给法（优先级从高到低）：
+        input_files  明确的文件列表（GUI 里「选择图片」走这条）
+        input_dir    指向单个图片文件
+        input_dir    指向目录 —— 扫描目录内的图片
 
     可选回调（GUI 使用；CLI 全部省略，行为与从前一致）：
         log(message, level="info")  输出一条日志，level ∈ info/ok/warn/error
         progress(done, total, name) 每处理完一张图片回调一次
         should_cancel() -> bool     返回 True 时在下一张图片之前中止
+
+    name_suffix  输出文件名后缀（如 "_bdd"）；空字符串表示保持原文件名
+    max_bytes    单张输出体积上限（字节）；0 表示不限制
 
     返回摘要 dict：
         {"ok": bool, "total": int, "success": int, "fail": int,
@@ -376,13 +526,31 @@ def process_directory(input_dir: str,
     input_path = Path(input_dir)
     output_path = Path(output_dir)
 
-    if not input_path.exists():
-        emit(f"错误：输入目录不存在: {input_dir}", "error")
-        return summary(False)
+    # ---- 解析输入：文件列表 > 单个文件 > 目录 ----
+    if input_files is None and input_path.is_file():
+        input_files = [input_path]
 
-    if not input_path.is_dir():
-        emit(f"错误：输入路径不是目录: {input_dir}", "error")
-        return summary(False)
+    if input_files is not None:
+        image_files = [Path(f) for f in input_files]
+        if not image_files:
+            emit("警告：没有指定任何图片文件。", "warn")
+            return summary(False)
+        missing = [f for f in image_files if not f.is_file()]
+        if missing:
+            names = "、".join(p.name for p in missing[:5])
+            emit(f"错误：以下文件不存在: {names}", "error")
+            return summary(False)
+    else:
+        if not input_path.exists():
+            emit(f"错误：输入目录不存在: {input_dir}", "error")
+            return summary(False)
+        if not input_path.is_dir():
+            emit(f"错误：输入路径既不是目录也不是文件: {input_dir}", "error")
+            return summary(False)
+        image_files = list_images(input_path)
+        if not image_files:
+            emit(f"警告：在 {input_dir} 中未找到支持的图片文件。", "warn")
+            return summary(False)
 
     try:
         output_path.mkdir(parents=True, exist_ok=True)
@@ -390,25 +558,21 @@ def process_directory(input_dir: str,
         emit(f"错误：无法创建输出目录 {output_dir}: {e}", "error")
         return summary(False)
 
-    image_files = list_images(input_path)
-
-    if not image_files:
-        emit(f"警告：在 {input_dir} 中未找到支持的图片文件。", "warn")
-        return summary(False)
-
     # 规划输出文件名，并做防覆盖/防冲突检查
     plan = []
     for f in image_files:
+        stem = f.stem + (name_suffix or "")
         if output_format == "png":
-            out_name = f.stem + ".png"
+            out_name = stem + ".png"
         elif output_format == "pdf":
-            out_name = f.stem + ".pdf"
+            out_name = stem + ".pdf"
         else:
-            out_name = f.name
+            out_name = stem + f.suffix
         out_path = output_path / out_name
         if out_path.resolve() == f.resolve():
             emit(
-                f"错误：输出文件与输入文件相同（请使用不同的输出目录）: {f.name}",
+                f"错误：输出文件与输入文件相同（请换一个输出目录，"
+                f"或设置文件名后缀）: {f.name}",
                 "error",
             )
             return summary(False, total=len(image_files))
@@ -435,6 +599,10 @@ def process_directory(input_dir: str,
     emit(f"输出格式: {output_format}")
     if output_format == "keep":
         emit(f"JPEG 质量: {jpeg_quality}")
+    if name_suffix:
+        emit(f"文件名后缀: {name_suffix}")
+    if max_bytes > 0:
+        emit(f"单张体积上限: {format_size(max_bytes)}（超限时自动降低质量）")
     emit("-" * 50)
 
     total = len(plan)
@@ -486,13 +654,17 @@ def process_directory(input_dir: str,
                     result = result.convert("RGB")
                 if save_format == "PNG" and result.mode == "CMYK":
                     result = result.convert("RGB")
-                result.save(
-                    output_file,
-                    format=save_format,
-                    **build_save_kwargs(img, save_format, jpeg_quality),
+                save_kwargs = build_save_kwargs(img, save_format, jpeg_quality)
+                used_q, nbytes, _size_ok = save_with_size_limit(
+                    result, output_file, save_format, save_kwargs,
+                    max_bytes=max_bytes, emit=emit,
                 )
+                detail = save_format
+                if save_format in ("JPEG", "WEBP"):
+                    detail += f" q={used_q}"
+                detail += f" {format_size(nbytes)}"
                 emit(
-                    f"[OK] {img_file.name}  {img.size} -> {result.size} ({save_format})",
+                    f"[OK] {img_file.name}  {img.size} -> {result.size} ({detail})",
                     "ok",
                 )
                 success_count += 1
@@ -591,19 +763,25 @@ def main():
             "  python Bordd.py -i ./photos -o ./result -r 4:3 -f png\n"
             "  python Bordd.py -i ./photos -o ./result -r 4:3 -f pdf\n"
             "  python Bordd.py -i ./photos -o ./compressed --no-border --jpeg-quality 90\n"
+            "\n"
+            "v1.3 新增:\n"
+            "  python Bordd.py -i ./a.jpg -r 4:3                 # 单张图片，输出 a_bdd.jpg\n"
+            "  python Bordd.py -i ./a.jpg -r 4:3 --suffix _out   # 自定义后缀\n"
+            "  python Bordd.py -i ./photos -o ./out -r 4:3 --max-size 10MB  # 限制单张体积\n"
         ),
     )
     parser.add_argument(
         "-i", "--input", required=True,
-        help="输入图片目录路径"
+        help="输入图片目录，或单个图片文件（v1.3 起支持文件）"
     )
     parser.add_argument(
-        "--version", action="version", version="%(prog)s 1.2.0",
+        "--version", action="version", version="%(prog)s 1.3.0",
         help="显示版本号并退出"
     )
     parser.add_argument(
-        "-o", "--output", required=True,
-        help="输出图片目录路径"
+        "-o", "--output", default=None,
+        help="输出目录（可省略：输入是文件时默认输出到同目录，"
+             "是目录时默认输出到同级的 <目录名>_bordered）"
     )
     parser.add_argument(
         "-r", "--ratio", default=None,
@@ -635,6 +813,17 @@ def main():
         "--no-border", action="store_true",
         help="不加任何边框，画布 = 原图尺寸，等价于纯图像压缩（--ratio/--color 被忽略）"
     )
+    parser.add_argument(
+        "--suffix", default=None,
+        help="输出文件名后缀（v1.3）。默认：输入为单个文件时用 _bdd，"
+             "输入为目录时保持原文件名。传空字符串表示不加后缀"
+    )
+    parser.add_argument(
+        "--max-size", dest="max_size", default=None, metavar="体积",
+        help="单张输出体积上限（v1.3，可选）。如 10MB、500KB。"
+             "超出时自动从 --jpeg-quality 往下降低质量，直到不超过上限。"
+             "留空表示不限制。仅对 JPEG / WebP 有效"
+    )
 
     # 双击启动（零参数）时给出明确指引并暂停：
     # 否则窗口会在打印用法后立即关闭，观感上就是“闪退”。
@@ -649,6 +838,36 @@ def main():
         sys.exit(2)
 
     args = parser.parse_args()
+
+    # ---- 输入到底是「单个文件」还是「目录」----
+    input_path = Path(args.input)
+    if not input_path.exists():
+        print(f"错误：输入路径不存在: {args.input}", file=sys.stderr)
+        sys.exit(1)
+
+    input_files = None
+    if input_path.is_file():
+        if input_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            print(f"错误：不支持的图片格式: {input_path.suffix}"
+                  f"（支持 {', '.join(sorted(SUPPORTED_EXTENSIONS))}）",
+                  file=sys.stderr)
+            sys.exit(1)
+        input_files = [input_path]
+        default_out = input_path.parent           # 单图模式：默认输出到同目录
+        default_suffix = "_bdd"                   # 并加后缀，避免覆盖原图
+    else:
+        default_out = input_path.parent / f"{input_path.name}_bordered"
+        default_suffix = ""                       # 目录模式：保持原文件名
+
+    output_dir = args.output or str(default_out)
+    name_suffix = default_suffix if args.suffix is None else args.suffix
+
+    # ---- 体积上限（可选）----
+    try:
+        max_bytes = parse_size(args.max_size)
+    except ValueError as e:
+        print(f"错误：{e}", file=sys.stderr)
+        sys.exit(1)
 
     target_ratio = None
     if args.no_border:
@@ -675,14 +894,17 @@ def main():
         sys.exit(1)
 
     summary = process_directory(
-        input_dir=args.input,
-        output_dir=args.output,
+        input_dir=str(input_path),
+        output_dir=output_dir,
         target_ratio=target_ratio,
         border_color=border_color,
         border_percent=args.border_percent,
         output_format=args.output_format,
         jpeg_quality=args.jpeg_quality,
         no_border=args.no_border,
+        input_files=input_files,
+        name_suffix=name_suffix,
+        max_bytes=max_bytes,
     )
 
     # 有失败或提前出错时以非 0 退出，便于脚本 / 批处理判断

@@ -39,7 +39,7 @@ ROOT = HERE.parent                              # 仓库根
 DIST = HERE / "dist"
 ASSETS = ROOT / "assets"
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 GUI_SPEC = "Bordd_gui.spec"
 CLI_SPEC = "Bordd_cli.spec"
 

@@ -8,6 +8,61 @@
 | Windows | `Bordd_gui.exe` | `Bordd.exe` |
 | macOS | `Bordd.app` | `Bordd` |
 
+当前版本：**1.3.0**
+
+---
+
+## v1.3 新增功能
+
+### 新增 1：可以只处理单张（或指定的几张）图片
+
+以前只能选一个**目录**，处理里面所有图片。现在多了一个入口：
+
+- 界面点 **「选图片」**（旁边是原来的「选文件夹」），可单选也可多选
+- 命令行直接把文件路径给 `-i`：
+
+  ```bash
+  Bordd -i ./a.jpg -r 4:3
+  ```
+
+**输出命名**：原文件名 + 后缀。默认后缀是 `_bdd`，可自定义：
+
+```bash
+Bordd -i ./a.jpg -r 4:3                    # -> a_bdd.jpg
+Bordd -i ./a.jpg -r 4:3 --suffix _out      # -> a_out.jpg
+```
+
+> 单图模式下**输出目录默认就是原图所在目录**，靠后缀避免覆盖原图。
+> 如果手工把后缀清空、又把输出目录设成原目录，程序会拒绝执行并提示。
+
+**目录模式完全不变**：仍然保持原文件名，加不加后缀由 `--suffix` 决定
+（不传 `--suffix` 时目录模式不加后缀，向后兼容）。
+
+### 新增 2：限制单张图片的体积（可选）
+
+给一个体积上限，程序会自动把 JPEG 质量往下调，直到输出不超过上限。
+
+```bash
+Bordd -i ./photos -o ./out -r 4:3 --max-size 10MB
+```
+
+界面里对应 **「单张体积上限」** 输入框（单位 MB）。
+
+规则：
+
+- **留空 = 不限制**（默认行为，和 v1.2 完全一样）
+- 填入后：先用你设定的 `--jpeg-quality`（默认 95）编码；
+  如果超过上限，就降低质量重新编码，直到不超过上限
+- 最终采用的是**「能满足上限的最高质量」**——画质损失最小
+- 只有 JPEG / WebP 这类有质量旋钮的格式有效；
+  PNG 是无损格式，无法压缩体积，超过时会给出提示但照常输出
+
+> **实现上的一点说明**：并没有真的从 95 一路 “95→94→93…” 线性试到 60
+> （那样一张大图要编码几十次，非常慢）。程序先用设定质量试一次，
+> 超限后再**二分查找**那个“刚好能满足上限”的质量（约 7 次编码），
+> 结果与逐个递减完全相同，但快得多。见 `bordd.py` 的
+> `save_with_size_limit()`。
+
 ---
 
 ## 目录结构
@@ -24,7 +79,8 @@ Bordd/                                （工作区根目录本身未改名，便
 │  └─ 给朋友的Mac安装运行指南.md      把程序分享给 Mac 用户的全流程
 ├─ tests/                           测试与截图工具
 │  ├─ smoke_test.py                 源码级冒烟测试（30 项）
-│  ├─ verify_frozen.py              冻结产物验收（20 项）
+│  ├─ test_v13.py                   v1.3 新功能验收（单图/后缀/体积上限，49 项）
+│  ├─ verify_frozen.py              冻结产物验收（22 项）
 │  ├─ test_launcher_logic.py        Mac 启动器逻辑测试（5 项，需 bash）
 │  ├─ verify_mac_package.py         Mac 传输包验收（40 项，需 bash）
 │  ├─ capture_gui.py / capture_window.py / click_start.py   界面截图与自动点击
@@ -107,18 +163,25 @@ Bordd -i ./photos -o ./out -r 4:3 -c black                       # 加边框（�
 Bordd -i ./photos -o ./out -r 4:3 -f pdf -c white                # PDF 容器（JPEG 字节级无损）
 Bordd -i ./photos -o ./out -r 4:3 -f png                         # 统一无损 PNG
 Bordd -i ./photos -o ./compressed --no-border --jpeg-quality 90  # 纯压缩
+
+# v1.3 新增
+Bordd -i ./a.jpg -r 4:3                        # 单张图片 -> a_bdd.jpg（同目录）
+Bordd -i ./a.jpg -r 4:3 --suffix _out          # 自定义后缀 -> a_out.jpg
+Bordd -i ./photos -o ./out -r 4:3 --max-size 10MB   # 限制单张体积
 ```
 
 | 参数 | 说明 |
 | --- | --- |
-| `-i, --input` | 输入图片目录（必填） |
-| `-o, --output` | 输出目录（必填；不得与输入目录相同） |
+| `-i, --input` | 输入目录，**或单个图片文件**（v1.3） |
+| `-o, --output` | 输出目录（**v1.3 起可省略**：输入是文件→同目录；是目录→同级 `<目录名>_bordered`） |
 | `-r, --ratio` | 目标宽高比：`4:3` / `3:4` / `9:16` / `16:9` / `1:1`，或自定义如 `21:9`；`--no-border` 时可省略 |
 | `-c, --color` | 边框颜色：`black`（默认）/ `white` |
 | `--border-percent` | 长边每侧边框占比（默认 `0.02`，即每边 2%） |
 | `-f, --format` | `keep`（默认）/ `png`（统一无损 PNG）/ `pdf`（PDF 容器，仅 JPEG） |
 | `--jpeg-quality` | keep 模式下的 JPEG 质量（默认 95，1–100） |
 | `--no-border` | 不加边框，画布 = 原图尺寸（纯压缩模式） |
+| `--suffix` | **v1.3** 输出文件名后缀。默认：单文件输入用 `_bdd`，目录输入不加 |
+| `--max-size` | **v1.3** 单张体积上限，如 `10MB` / `500KB`；留空 = 不限制 |
 | `--version` | 显示版本号 |
 
 **退出码**：全部成功 `0`；有图片处理失败或参数/目录错误 `1`；参数缺失 `2`。
@@ -316,7 +379,8 @@ Bordd.app/Contents/
 
 ```bash
 python tests/smoke_test.py                              # 源码级（30 项）
-python tests/verify_frozen.py                           # Windows 产物（20 项）
+python tests/test_v13.py                                # v1.3 新功能（49 项）
+python tests/verify_frozen.py                           # Windows 产物（22 项）
 python tests/test_launcher_logic.py  <bash路径>          # Mac 探测逻辑（5 项）
 python tests/verify_mac_package.py   <bash路径>          # Mac 传输包（40 项）
 ```
@@ -324,6 +388,7 @@ python tests/verify_mac_package.py   <bash路径>          # Mac 传输包（40 
 | 脚本 | 覆盖内容 |
 | --- | --- |
 | `smoke_test.py` | 界面构建、控件联动、参数校验、预览生成、三种输出格式真实处理、纯压缩画布、防覆盖保护、取消功能、异常钩子 |
+| `test_v13.py` | `parse_size` 各种写法、`save_with_size_limit` 的**最大性**（选出的质量确实是能满足上限的最高档）、单图/多图输入、后缀命名、目录模式不加后缀、空后缀拒绝覆盖、PNG 无损格式的超限提示、GUI 控件状态与参数收集 |
 | `verify_frozen.py` | 产物存在性、`--version` / `--help`、三种格式真实处理、画布比例与边框像素、纯压缩画布、**PDF 图像流与源 JPEG 逐字节一致**、防覆盖、退出码、非法参数、**双击时暂停不闪退** |
 | `test_launcher_logic.py` | `find_python` 的版本过滤与 PATH 扫描（伪造 3.9 / 3.12 解释器） |
 | `verify_mac_package.py` | `.app` 结构、`Info.plist` 字段、脚本 LF/无 BOM/`bash -n`、source 路径可解析、zip 权限位、zip 内容逐字节一致 |

@@ -23,6 +23,7 @@ Bordd 图形界面（Tkinter / ttk，跨平台：Windows + macOS）。
 
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -39,23 +40,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from bordd import (  # noqa: E402
     PRESET_RATIOS,
+    SUPPORTED_EXTENSIONS,
     ProcessingCancelled,
     add_border_to_image,
     compute_canvas_size,
+    format_size,
     get_border_color,
     list_images,
     parse_ratio,
+    parse_size,
     process_directory,
 )
 
 APP_NAME = "Bordd"          # 对话框标题、日志目录名
 APP_TITLE = "Bordd"         # 窗口标题栏只显示 Bordd
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # 边框宽度滑杆范围（百分比）
 BORDER_PCT_MIN = 0.0
 BORDER_PCT_MAX = 40.0
 BORDER_PCT_DEFAULT = 2.0
+
+# 单图模式的默认文件名后缀（避免覆盖原图）
+DEFAULT_SUFFIX = "_bdd"
 
 # 预览区基准尺寸（逻辑像素，会按 DPI 缩放）
 PREVIEW_W = 300
@@ -149,9 +156,16 @@ def _open_in_file_manager(path: Path) -> None:
         subprocess.Popen(["xdg-open", str(path)])
 
 
-def _default_output_dir(input_dir: Path) -> Path:
-    """默认输出目录：输入目录同级的 <名字>_bordered。"""
-    return input_dir.parent / f"{input_dir.name}_bordered"
+def _default_output_dir(input_path: Path) -> Path:
+    """默认输出目录。
+
+    输入是单个图片文件 -> 就用它所在的目录（靠文件名后缀避免覆盖原图）；
+    输入是目录         -> 同级的 <目录名>_bordered。
+    """
+    p = Path(input_path)
+    if p.is_file() or p.suffix.lower() in SUPPORTED_EXTENSIONS:
+        return p.parent
+    return p.parent / f"{p.name}_bordered"
 
 
 def _format_ratio(w: int, h: int) -> str:
@@ -189,6 +203,9 @@ class AddBorderApp(ttk.Frame):
         self._preview_job: str | None = None
         self._preview_image = None  # 必须持有引用，否则被 GC 后不显示
         self._preview_token = 0
+        # v1.3：已明确选中的图片文件（非空 = 单图/多图模式，忽略目录扫描）
+        self._selected_files: list[Path] = []
+        self._updating_input = False
 
         # 按 DPI 计算缩放系数（96 DPI == 1.0）
         try:
@@ -209,6 +226,9 @@ class AddBorderApp(ttk.Frame):
         self.var_open_after = tk.BooleanVar(value=False)
         self.var_status = tk.StringVar(value="就绪")
         self.var_preview_info = tk.StringVar(value="选择输入目录后显示预览")
+        # v1.3 新增
+        self.var_suffix = tk.StringVar(value=DEFAULT_SUFFIX)
+        self.var_max_size = tk.StringVar(value="")   # 空 = 不限制体积
 
         self._build_ui()
         self._bind_events()
@@ -231,21 +251,26 @@ class AddBorderApp(ttk.Frame):
         dirs.columnconfigure(1, weight=1)
         row += 1
 
-        ttk.Label(dirs, text="输入目录：").grid(row=0, column=0, sticky="w", pady=3)
+        ttk.Label(dirs, text="输入：").grid(row=0, column=0, sticky="w", pady=3)
         self.ent_input = ttk.Entry(dirs, textvariable=self.var_input)
         self.ent_input.grid(row=0, column=1, sticky="ew", padx=(4, 6), pady=3)
-        ttk.Button(dirs, text="浏览…", width=9,
-                   command=self._pick_input).grid(row=0, column=2, pady=3)
+        self.btn_pick_dir = ttk.Button(dirs, text="选文件夹", width=9,
+                                       command=self._pick_input)
+        self.btn_pick_dir.grid(row=0, column=2, pady=3)
+        self.btn_pick_files = ttk.Button(dirs, text="选图片", width=8,
+                                         command=self._pick_files)
+        self.btn_pick_files.grid(row=0, column=3, padx=(4, 0), pady=3)
 
         ttk.Label(dirs, text="输出目录：").grid(row=1, column=0, sticky="w", pady=3)
         self.ent_output = ttk.Entry(dirs, textvariable=self.var_output)
         self.ent_output.grid(row=1, column=1, sticky="ew", padx=(4, 6), pady=3)
-        self.btn_output = ttk.Button(dirs, text="浏览…", width=9,
+        self.btn_output = ttk.Button(dirs, text="浏览…", width=8,
                                      command=self._pick_output)
-        self.btn_output.grid(row=1, column=2, pady=3)
+        self.btn_output.grid(row=1, column=2, columnspan=2, sticky="ew",
+                             padx=(4, 0), pady=3)
 
-        self.lbl_found = ttk.Label(dirs, text="尚未选择输入目录", foreground="#666666")
-        self.lbl_found.grid(row=2, column=0, columnspan=3, sticky="w", pady=(5, 0))
+        self.lbl_found = ttk.Label(dirs, text="尚未选择输入", foreground="#666666")
+        self.lbl_found.grid(row=2, column=0, columnspan=4, sticky="w", pady=(5, 0))
 
         # ============ 2. 设置（双列排布，压缩高度以适配 1366×768 等小屏）============
         settings = ttk.LabelFrame(self, text=" 处理设置 ", padding=(10, 8))
@@ -322,6 +347,22 @@ class AddBorderApp(ttk.Frame):
             settings, text="完成后打开输出目录", variable=self.var_open_after)
         self.chk_open_after.grid(row=5, column=2, columnspan=2, sticky="w",
                                  padx=(4, 0), pady=(2, 0))
+
+        # -- 第 6 行：文件名后缀 / 单张体积上限（v1.3）--
+        ttk.Label(settings, text="文件名后缀：").grid(row=6, column=0,
+                                                      sticky="w", pady=3)
+        self.ent_suffix = ttk.Entry(settings, textvariable=self.var_suffix, width=10)
+        self.ent_suffix.grid(row=6, column=1, sticky="w", padx=(4, 18), pady=3)
+
+        ttk.Label(settings, text="单张体积上限：").grid(row=6, column=2,
+                                                       sticky="w", pady=3)
+        size_box = ttk.Frame(settings)
+        size_box.grid(row=6, column=3, sticky="w", padx=(4, 0), pady=3)
+        self.ent_max_size = ttk.Entry(size_box, textvariable=self.var_max_size,
+                                      width=7)
+        self.ent_max_size.pack(side="left")
+        ttk.Label(size_box, text=" MB（留空 = 不限制）",
+                  foreground="#666666").pack(side="left")
 
         # ============ 3. 预览 ============
         preview = ttk.LabelFrame(self, text=" 效果预览 ", padding=(10, 8))
@@ -406,48 +447,117 @@ class AddBorderApp(ttk.Frame):
                                                        self._schedule_preview()))
         self.var_no_border.trace_add("write", lambda *_: self._schedule_preview())
         self.var_jpeg_quality.trace_add("write", lambda *_: self._sync_enabled_states())
+        self.var_max_size.trace_add("write", lambda *_: self._sync_enabled_states())
 
         self.master.bind("<Return>", lambda _e: self._start())
         self.canvas.bind("<Configure>", lambda _e: self._schedule_preview())
 
     # ------------------------------------------------------------------
-    # 目录选择
+    # 输入 / 输出选择
     # ------------------------------------------------------------------
     def _pick_input(self) -> None:
         initial = self.var_input.get().strip() or str(Path.home())
         chosen = filedialog.askdirectory(title="选择输入图片目录", initialdir=initial)
         if chosen:
-            self.var_input.set(os.path.normpath(chosen))
-            if not self.var_output.get().strip():
-                self.var_output.set(str(_default_output_dir(Path(chosen))))
+            self._set_input_dir(Path(os.path.normpath(chosen)))
+
+    def _pick_files(self) -> None:
+        """选择单张或多张图片（v1.3 新增）。"""
+        initial = self.var_input.get().strip()
+        if initial and not Path(initial).is_dir():
+            initial = str(Path(initial).parent)
+        patterns = " ".join(f"*{e}" for e in sorted(SUPPORTED_EXTENSIONS))
+        chosen = filedialog.askopenfilenames(
+            title="选择图片（可多选）",
+            initialdir=initial or str(Path.home()),
+            filetypes=[("图片文件", patterns), ("所有文件", "*.*")],
+        )
+        if chosen:
+            self._set_input_files([Path(c) for c in chosen])
+
+    def _set_input_dir(self, path: Path) -> None:
+        """切到「目录」模式。"""
+        self._selected_files = []
+        self._updating_input = True
+        try:
+            self.var_input.set(str(path))
+            self.var_output.set(str(_default_output_dir(path)))
+            # 注意：必须在 _updating_input 仍为 True 时调用，
+            # 否则 _on_input_changed 会把这次程序化赋值误判成「手动编辑」。
+            self._on_input_changed()
+        finally:
+            self._updating_input = False
+
+    def _set_input_files(self, files: list) -> None:
+        """切到「指定图片」模式（单张或多张）。"""
+        self._selected_files = sorted(Path(f) for f in files)
+        self._updating_input = True
+        try:
+            if len(self._selected_files) == 1:
+                self.var_input.set(str(self._selected_files[0]))
+            else:
+                parent = self._selected_files[0].parent
+                self.var_input.set(
+                    f"{parent}  （已选 {len(self._selected_files)} 张图片）")
+            if self._selected_files:
+                self.var_output.set(
+                    str(_default_output_dir(self._selected_files[0])))
+            self._on_input_changed()
+        finally:
+            self._updating_input = False
+
+    def _input_files(self) -> list:
+        """当前要处理哪些文件（空列表表示还没选好）。"""
+        if self._selected_files:
+            return [f for f in self._selected_files if f.is_file()]
+        raw = self.var_input.get().strip()
+        if not raw:
+            return []
+        p = Path(raw)
+        if p.is_file():
+            return [p]
+        return list_images(p)
 
     def _pick_output(self) -> None:
         initial = self.var_output.get().strip()
         if not initial:
-            raw_in = self.var_input.get().strip()
-            initial = (str(_default_output_dir(Path(raw_in))) if raw_in
-                       else str(Path.home()))
+            files = self._input_files()
+            if files:
+                initial = str(_default_output_dir(files[0]))
+            else:
+                initial = str(Path.home())
         chosen = filedialog.askdirectory(title="选择输出目录", initialdir=initial)
         if chosen:
             self.var_output.set(os.path.normpath(chosen))
 
     def _on_input_changed(self) -> None:
-        raw = self.var_input.get().strip()
-        if not raw:
-            self.lbl_found.configure(text="尚未选择输入目录", foreground="#666666")
+        # 手动编辑输入框 => 退出「指定图片」模式
+        if not self._updating_input and self._selected_files:
+            raw = self.var_input.get().strip()
+            if not self._selected_files or all(
+                    str(f) != raw for f in self._selected_files):
+                self._selected_files = []
+
+        files = self._input_files()
+        if not files:
+            self.lbl_found.configure(text="尚未选择输入", foreground="#666666")
+        elif self._selected_files:
+            total = sum(f.stat().st_size for f in files if f.exists())
+            self.lbl_found.configure(
+                text=f"已选 {len(files)} 张图片，共 {format_size(total)}"
+                     f"（输出名加后缀）",
+                foreground="#1e7e34")
         else:
+            raw = self.var_input.get().strip()
             p = Path(raw)
             if not p.is_dir():
-                self.lbl_found.configure(text=f"目录不存在：{raw}", foreground="#c0392b")
+                self.lbl_found.configure(text=f"目录不存在：{raw}",
+                                         foreground="#c0392b")
             else:
-                images = list_images(p)
-                if images:
-                    self.lbl_found.configure(
-                        text=f"找到 {len(images)} 张受支持的图片", foreground="#1e7e34")
-                else:
-                    self.lbl_found.configure(
-                        text="该目录下没有受支持的图片（png / jpg / jpeg / webp / bmp / tif / tiff）",
-                        foreground="#b9770e")
+                self.lbl_found.configure(
+                    text=f"该目录下有 {len(files)} 张受支持的图片",
+                    foreground="#1e7e34")
+        self._sync_enabled_states()
         self._schedule_preview()
 
     def _sync_enabled_states(self) -> None:
@@ -479,11 +589,19 @@ class AddBorderApp(ttk.Frame):
         self.ent_input.configure(state="normal" if idle else "disabled")
         self.ent_output.configure(state="normal" if idle else "disabled")
         self.btn_output.configure(state="normal" if idle else "disabled")
+        self.btn_pick_dir.configure(state="normal" if idle else "disabled")
+        self.btn_pick_files.configure(state="normal" if idle else "disabled")
         self.cmb_format.configure(state="readonly" if idle else "disabled")
         self.chk_no_border.configure(state="normal" if idle else "disabled")
         self.btn_start.configure(state="normal" if idle else "disabled")
         if idle and no_border:
             self.cmb_ratio.configure(state="disabled")
+
+        # v1.3：文件名后缀只在「选了具体图片」时有意义；体积上限任何时候都可设
+        has_files = bool(self._selected_files)
+        self.ent_suffix.configure(
+            state="normal" if (idle and has_files) else "disabled")
+        self.ent_max_size.configure(state="normal" if idle else "disabled")
 
     def _selected_format(self) -> str:
         label = self.var_format.get()
@@ -538,14 +656,13 @@ class AddBorderApp(ttk.Frame):
         self._preview_job = None
         fmt = self._selected_format()
 
-        raw_in = self.var_input.get().strip()
-        images = list_images(raw_in) if raw_in else []
+        images = self._input_files()
         if not images:
             self._draw_placeholder_preview()
             if fmt == "pdf":
                 self.var_preview_info.set("PDF 保真模式：\n仅支持 JPEG 输入")
             else:
-                self.var_preview_info.set("选择输入目录后显示预览")
+                self.var_preview_info.set("选择输入目录或图片后显示预览")
             return
 
         first = images[0]
@@ -701,41 +818,74 @@ class AddBorderApp(ttk.Frame):
     # ------------------------------------------------------------------
     def _collect_options(self):
         """校验并收集参数；出错时弹窗并返回 None。"""
-        raw_in = self.var_input.get().strip()
+        images = self._input_files()
         raw_out = self.var_output.get().strip()
 
-        if not raw_in:
-            messagebox.showwarning(APP_NAME, "请先选择输入图片目录。", parent=self.master)
-            return None
-        in_path = Path(raw_in)
-        if not in_path.is_dir():
-            messagebox.showerror(APP_NAME, f"输入目录不存在：\n{raw_in}",
-                                 parent=self.master)
-            return None
-
-        images = list_images(in_path)
         if not images:
             messagebox.showwarning(
                 APP_NAME,
-                "输入目录中没有受支持的图片。\n\n"
-                "支持的格式：png / jpg / jpeg / webp / bmp / tif / tiff",
+                "请先选择输入：\n\n"
+                "· 「选文件夹」—— 处理整个目录\n"
+                "· 「选图片」—— 处理指定的一个或多个图片文件",
                 parent=self.master)
             return None
 
+        base_input = (str(self._selected_files[0]) if self._selected_files
+                      else self.var_input.get().strip())
+
         if not raw_out:
-            raw_out = str(_default_output_dir(in_path))
+            raw_out = str(_default_output_dir(images[0]))
             self.var_output.set(raw_out)
         out_path = Path(raw_out)
-        try:
-            if out_path.resolve() == in_path.resolve():
+
+        # ---- 文件名后缀（仅「选图片」模式有意义）----
+        name_suffix = ""
+        if self._selected_files:
+            name_suffix = self.var_suffix.get()
+            if any(c in name_suffix for c in '<>:"/\\|?*'):
                 messagebox.showerror(
                     APP_NAME,
-                    "输出目录不能与输入目录相同。\n\n"
-                    "输出文件会与源文件重名并覆盖源文件。",
+                    '文件名后缀不能包含这些字符：< > : " / \\ | ? *',
                     parent=self.master)
                 return None
-        except OSError:
-            pass
+            if not name_suffix:
+                try:
+                    if out_path.resolve() == Path(base_input).parent.resolve():
+                        messagebox.showerror(
+                            APP_NAME,
+                            "后缀为空且输出到原目录，会覆盖原图。\n\n"
+                            "请填写后缀（例如 _bdd），或换一个输出目录。",
+                            parent=self.master)
+                        return None
+                except OSError:
+                    pass
+
+        # ---- 单张体积上限（单位 MB）----
+        max_text = self.var_max_size.get().strip()
+        max_bytes = 0
+        if max_text:
+            try:
+                max_bytes = parse_size(
+                    max_text if re.search(r"[A-Za-z]", max_text)
+                    else max_text + "MB")
+            except ValueError as e:
+                messagebox.showerror(APP_NAME, f"{e}", parent=self.master)
+                return None
+            if max_bytes <= 0:
+                messagebox.showerror(
+                    APP_NAME,
+                    "体积上限必须大于 0。\n留空表示不限制体积。",
+                    parent=self.master)
+                return None
+            if self._selected_format() == "png":
+                if not messagebox.askyesno(
+                    APP_NAME,
+                    "「统一无损 PNG」是无损格式，无法通过降低质量来控制体积，\n"
+                    "所以体积上限对 PNG 不起作用（会照常输出并提示）。\n\n"
+                    "确定继续吗？",
+                    parent=self.master,
+                ):
+                    return None
 
         no_border = self.var_no_border.get()
         fmt = self._selected_format()
@@ -783,7 +933,8 @@ class AddBorderApp(ttk.Frame):
                     return None
 
         return {
-            "input_dir": str(in_path),
+            "input_dir": base_input,
+            "input_files": [str(f) for f in self._selected_files] or None,
             "output_dir": str(out_path),
             "target_ratio": target_ratio,
             "border_color": get_border_color(self.var_color.get()),
@@ -791,6 +942,8 @@ class AddBorderApp(ttk.Frame):
             "output_format": fmt,
             "jpeg_quality": quality,
             "no_border": no_border,
+            "name_suffix": name_suffix,
+            "max_bytes": max_bytes,
             "image_count": len(images),
         }
 
@@ -809,8 +962,17 @@ class AddBorderApp(ttk.Frame):
         self.txt_log.configure(state="disabled")
 
         self._append_log("=" * 62, "head")
-        self._append_log(f"输入目录：{opts['input_dir']}", "head")
+        if opts.get("input_files"):
+            self._append_log(f"输入图片：{len(opts['input_files'])} 个文件", "head")
+            self._append_log(f"　　　　　{opts['input_files'][0]}", "head")
+        else:
+            self._append_log(f"输入目录：{opts['input_dir']}", "head")
         self._append_log(f"输出目录：{opts['output_dir']}", "head")
+        if opts.get("name_suffix"):
+            self._append_log(f"文件名后缀：{opts['name_suffix']}", "head")
+        if opts.get("max_bytes"):
+            self._append_log(
+                f"单张体积上限：{format_size(opts['max_bytes'])}", "head")
         self._append_log(f"待处理：{opts['image_count']} 张图片", "head")
         self._append_log("=" * 62, "head")
 
@@ -839,6 +1001,9 @@ class AddBorderApp(ttk.Frame):
                 output_format=opts["output_format"],
                 jpeg_quality=opts["jpeg_quality"],
                 no_border=opts["no_border"],
+                input_files=opts.get("input_files"),
+                name_suffix=opts.get("name_suffix", ""),
+                max_bytes=opts.get("max_bytes", 0),
                 log=emit,
                 progress=report,
                 should_cancel=cancel,

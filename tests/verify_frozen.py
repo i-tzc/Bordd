@@ -90,7 +90,7 @@ def main() -> int:
 
     # 2. --version
     rc, out = run_cli("--version")
-    check("--version 退出码 0 且版本为 1.2.0", rc == 0 and "1.2.0" in out, out.strip())
+    check("--version 退出码 0 且版本为 1.3.0", rc == 0 and "1.3.0" in out, out.strip())
 
     # 3. --help
     rc, out = run_cli("--help")
